@@ -129,9 +129,30 @@ public class RemoteSession {
             );
             SSLSocketFactory sslSocketFactory = sSLContext.getSocketFactory();
 
+            // ── Wake port knock (Android 14+ low power standby) ──────────────
+            // In standby the TV closes 6466 and only keeps 6465 open. Connecting
+            // there (same client cert) brings the remote service back, exactly
+            // like the official Google TV app does.
+            SSLSocket wakeSocket = null;
+            if (!isPortOpen(mHost, mPort, 1200)) {
+                wakeSocket = knockWakePort(sslSocketFactory);
+                for (int i = 0; i < 10 && !isPortOpen(mHost, mPort, 800); i++) {
+                    try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+                }
+            }
+
             // ── Connect with timeout
             SSLSocket sSLSocket = (SSLSocket) sslSocketFactory.createSocket();
-            sSLSocket.connect(new java.net.InetSocketAddress(mHost, mPort), CONNECT_TIMEOUT_MS);
+            try {
+                sSLSocket.connect(new java.net.InetSocketAddress(mHost, mPort), CONNECT_TIMEOUT_MS);
+            } finally {
+                if (wakeSocket != null) {
+                    final SSLSocket ws = wakeSocket;
+                    new Thread(() -> {
+                        try { Thread.sleep(5000); ws.close(); } catch (Exception ignored) {}
+                    }, "wake-port-close").start();
+                }
+            }
 
             // Timeout during handshake
             sSLSocket.setSoTimeout(HANDSHAKE_WAIT_MS);
@@ -591,4 +612,34 @@ public class RemoteSession {
     }
 
 
+    private static final int WAKE_PORT = 6465;
+
+    private static boolean isPortOpen(String host, int port, int timeoutMs) {
+        try (java.net.Socket sock = new java.net.Socket()) {
+            sock.connect(new java.net.InetSocketAddress(host, port), timeoutMs);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private SSLSocket knockWakePort(SSLSocketFactory factory) {
+        try {
+            Log.i(TAG_WAKE, "Remote port closed, knocking wake port " + WAKE_PORT);
+            SSLSocket s = (SSLSocket) factory.createSocket();
+            s.connect(new java.net.InetSocketAddress(mHost, WAKE_PORT), 3000);
+            s.setSoTimeout(3000);
+            s.setUseClientMode(true);
+            s.setKeepAlive(true);
+            try { s.startHandshake(); } catch (Exception e) {
+                Log.w(TAG_WAKE, "Wake port handshake failed (TCP knock still sent): " + e);
+            }
+            return s;
+        } catch (Exception e) {
+            Log.w(TAG_WAKE, "Wake port knock failed: " + e);
+            return null;
+        }
+    }
+
+    private static final String TAG_WAKE = "AtvWakePort";
 }

@@ -31,6 +31,7 @@ import com.connectsdk.service.sessions.LaunchSession
 import com.hari.androidtvremote.App
 import com.hari.androidtvremote.services.KeepAliveService
 import com.hari.androidtvremote.utils.Constant
+import com.hari.androidtvremote.utils.AtvNsdDiscovery
 import com.hari.androidtvremote.androidLib.AndroidRemoteTv
 import com.hari.androidtvremote.androidLib.AndroidTvListener
 import com.hari.androidtvremote.androidLib.remote.Remotemessage
@@ -90,6 +91,32 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     private val reachableHosts = ConcurrentHashMap.newKeySet<String>()
     private val validatingHosts = ConcurrentHashMap.newKeySet<String>()
 
+    // ── Direct Android TV discovery (no Chromecast needed) ──────────────────
+    // TVs found via the remote-control mDNS record (_androidtvremote2._tcp),
+    // keyed by IP. These have no ConnectSDK services; the remote protocol
+    // (port 6466) is all we need for the remote.
+    private val nsdDevices = ConcurrentHashMap<String, ConnectableDevice>()
+    private val atvDiscovery = AtvNsdDiscovery(application) { host, name ->
+        viewModelScope.launch(Dispatchers.Main) { addNsdDevice(host, name) }
+    }
+
+    private fun addNsdDevice(host: String, name: String) {
+        val alreadyKnown = synchronized(discoveredDevices) {
+            discoveredDevices.values.any { it.ipAddress == host && it.id != nsdId(host) }
+        }
+        if (alreadyKnown) return  // Cast discovery already reported this TV
+        val device = nsdDevices.getOrPut(host) {
+            ConnectableDevice(host, name, "Android TV", null).apply { id = nsdId(host) }
+        }
+        if (!name.isBlank()) device.friendlyName = name
+        synchronized(discoveredDevices) { discoveredDevices[device.id] = device }
+        validateReachability(device)
+        publishDeviceSnapshot()
+        scheduleAutoReconnect(delayMs = 300L)
+    }
+
+    private fun nsdId(host: String) = "atv-nsd-$host"
+
     private val _uiState = MutableStateFlow(TvRemoteUiState())
     val uiState: StateFlow<TvRemoteUiState> = _uiState.asStateFlow()
 
@@ -148,6 +175,16 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
     init {
         discoveryManager?.addListener(this)
         discoveryManager?.start()
+        atvDiscovery.start()
+        // Seed the last paired TV right away so auto-reconnect can start
+        // without waiting for any network discovery.
+        val savedHost = prefs.getString(Constant.HOST, null)
+        if (!savedHost.isNullOrBlank() && prefs.getBoolean(Constant.PIN, false)) {
+            nsdDevices.getOrPut(savedHost) {
+                ConnectableDevice(savedHost, prefs.getString(PREF_SAVED_NAME, null) ?: "Android TV", "Android TV", null)
+                    .apply { id = nsdId(savedHost) }
+            }
+        }
         refreshDiscoveredDevices()
         if (isWifiConnected()) {
             scheduleAutoReconnect(delayMs = 800L)
@@ -229,7 +266,14 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
                     validateReachability(device)
                 }
             }
+            nsdDevices.values.forEach { device ->
+                if (discoveredDevices.values.none { it.ipAddress == device.ipAddress }) {
+                    discoveredDevices[device.id] = device
+                    validateReachability(device)
+                }
+            }
         }
+        atvDiscovery.restart()
         publishDeviceSnapshot()
         scheduleAutoReconnect(delayMs = 500L)
     }
@@ -801,6 +845,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         KeepAliveService.stop(app)
         playbackPollJob?.cancel()
         discoveryManager?.removeListener(this)
+        atvDiscovery.stop()
         try {
             connectivityManager.unregisterNetworkCallback(networkCallback)
         } catch (_: Exception) {}
@@ -1028,7 +1073,12 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
 
         currentConnectableListener = listener
         device.addListener(listener)
-        device.connect()
+        if (device.services.isEmpty()) {
+            prefs.edit { putString(PREF_SAVED_NAME, device.friendlyName) }
+            viewModelScope.launch(Dispatchers.Main) { listener.onDeviceReady(device) }
+        } else {
+            device.connect()
+        }
     }
 
     private fun updateVolumeState(level: Int, maxLevel: Int, muted: Boolean) {
@@ -1410,7 +1460,8 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         if (!validatingHosts.add(host)) return
 
         viewModelScope.launch(Dispatchers.IO) {
-            val reachable = isHostPortOpen(host, CAST_PORT) || isHostPortOpen(host, REMOTE_PORT)
+            val reachable = isHostPortOpen(host, CAST_PORT) || isHostPortOpen(host, REMOTE_PORT) ||
+                isHostPortOpen(host, WAKE_PORT)  // TV in standby: only the wake port stays open
             if (reachable) reachableHosts.add(host) else reachableHosts.remove(host)
             validatingHosts.remove(host)
             publishDeviceSnapshot()
@@ -1518,6 +1569,7 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
             return true
         }
         if (getServiceByName(ConnectSdkCastService.ID) != null) return true
+        if (id.startsWith("atv-nsd-")) return true
         val primaryServiceId = serviceDescription?.serviceID
         if (primaryServiceId != null && primaryServiceId.equals(ConnectSdkCastService.ID, ignoreCase = true)) {
             return true
@@ -1559,6 +1611,8 @@ class TvRemoteViewModel(application: Application) : AndroidViewModel(application
         const val TAG = "TvRemoteViewModel"
         const val CAST_PORT = 8009
         const val REMOTE_PORT = 6466
+        const val WAKE_PORT = 6465
+        const val PREF_SAVED_NAME = "atv_saved_device_name"
         const val REACHABILITY_TIMEOUT_MS = 700
         const val MANUAL_DISCONNECT_COOLDOWN_MS = 15_000L
 
